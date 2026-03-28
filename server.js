@@ -1,9 +1,16 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
 // Frontend will be on Firebase Hosting, so we don't serve static files here.
+
+// Enable CORS for all Express HTTP routes
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST']
+}));
 
 const server = http.createServer(app);
 
