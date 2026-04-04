@@ -6,7 +6,8 @@
  * Prevents queue drift and includes idempotency keys.
  */
 
-const { redis, createMatch, getUser } = require('./db');
+const db = require('./db');
+const { redis, createMatch, getUser } = db;
 const { v4: uuidv4 } = require('uuid');
 
 let isMatching = false;
@@ -181,7 +182,19 @@ async function releaseLock(workerId) {
 }
 
 function startWorker() {
-  console.log('[Worker] Initializing ATOMIC queue matching worker...');
+  console.log('[Worker] Queue matching worker registered — waiting for Redis...');
+
+  // Defer interval start until Redis is actually ready.
+  // This prevents the ECONNREFUSED flood during Railway cold-starts.
+  if (redis.status === 'ready') {
+    _beginInterval();
+  } else {
+    redis.once('ready', _beginInterval);
+  }
+}
+
+function _beginInterval() {
+  console.log('[Worker] Redis ready — starting ATOMIC queue matching worker.');
   setInterval(runBackgroundMatcher, 3000);
 }
 

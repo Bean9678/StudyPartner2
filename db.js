@@ -14,31 +14,76 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/chatApp')
   .then(() => console.log('[DB] MongoDB Connected'))
   .catch(err => console.error('[DB] MongoDB Connection Error:', err));
 
-// Connect Redis — auto-detects TLS for Railway Redis (rediss://)
+// ─── Redis Connection ─────────────────────────────────────────────────────────
+//
+// KEY DECISIONS:
+//   maxRetriesPerRequest: null — REQUIRED. Any non-null value causes
+//     MaxRetriesPerRequestError when Redis is briefly unavailable (e.g. Railway
+//     cold-start). ioredis/BullMQ expect null for long-lived blocking commands.
+//
+//   lazyConnect: true — The client won't attempt to connect until the first
+//     command is issued. This prevents a crash-at-boot when Railway Redis
+//     hasn't warmed up yet, and avoids flooding logs with connection errors
+//     before the server is ready to accept requests.
+//
+//   connectTimeout — Hard upper bound so a hung TCP handshake doesn't block
+//     the event loop indefinitely.
+
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+
 const redisOptions = {
-  maxRetriesPerRequest: 3,
+  // ── Critical: must be null for BullMQ / long-lived commands ──
+  maxRetriesPerRequest: null,
+
+  // ── Lazy connect: defer until first command ──
+  lazyConnect: true,
+
+  // ── Hard timeout on initial TCP connect (ms) ──
+  connectTimeout: 10_000,
+
+  // ── Exponential backoff: 200ms → 400ms → … → 5s cap, stop after 20 tries ──
   retryStrategy(times) {
-    if (times > 10) {
-      console.error('[DB] Redis: too many retries. Giving up.');
-      return null; // Stop retrying
+    if (times > 20) {
+      console.error('[Redis] Giving up after 20 reconnect attempts.');
+      return null; // null = stop retrying (ioredis won't throw, just stays disconnected)
     }
-    return Math.min(times * 200, 3000); // Exponential backoff capped at 3s
+    const delay = Math.min(200 * Math.pow(1.5, times), 5000);
+    return Math.round(delay);
   },
+
+  // ── Reconnect on READONLY (Redis Sentinel / cluster failover) ──
   reconnectOnError(err) {
-    // Reconnect on READONLY errors (common during Redis failover)
     return err.message.includes('READONLY');
   },
 };
 
-// Railway Redis uses rediss:// (TLS). Append tls: {} so ioredis negotiates SSL.
+// Railway Redis uses rediss:// (TLS). Add tls:{} so ioredis negotiates SSL.
 if (REDIS_URL.startsWith('rediss://')) {
   redisOptions.tls = { rejectUnauthorized: false };
 }
 
 const redis = new Redis(REDIS_URL, redisOptions);
-redis.on('connect', () => console.log('[DB] Redis Connected:', REDIS_URL.replace(/:[^:@]+@/, ':***@')));
-redis.on('error', (err) => console.error('[DB] Redis Error:', err.message));
+
+// ── Non-spammy event logging ──
+let _redisReady = false;
+redis.on('ready', () => {
+  _redisReady = true;
+  const safeUrl = REDIS_URL.replace(/:[^:@]+@/, ':***@');
+  console.log('[Redis] Connected and ready:', safeUrl);
+});
+redis.on('close',       () => { _redisReady = false; console.warn('[Redis] Connection closed.'); });
+redis.on('reconnecting', (ms) => console.log(`[Redis] Reconnecting in ${ms}ms…`));
+redis.on('error',        (err) => {
+  // Suppress the ECONNREFUSED flood — one log per unique message is enough
+  if (!_redisReady) {
+    console.error('[Redis] Connection error (waiting for Redis to be available):', err.message);
+  }
+});
+
+// Kick off the lazy connection so the client is ready before the first request
+redis.connect().catch((err) => {
+  console.error('[Redis] Initial connect failed (will retry automatically):', err.message);
+});
 
 // ─── LUA SCRIPTS (ATOMIC GUARANTEES) ─────────────────────────────────────────
 

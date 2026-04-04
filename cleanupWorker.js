@@ -5,7 +5,8 @@
  * Continually sweeps the Queue for drift (ZSET inconsistencies).
  */
 
-const { redis, transitionUser, getMatchesForUser } = require('./db');
+const db = require('./db');
+const { redis, transitionUser, getMatchesForUser } = db;
 
 let isSweepingDisconnected = false;
 let isSweepingQueue = false;
@@ -87,7 +88,17 @@ async function sweepDisconnected() {
 }
 
 function startCleanup() {
-  console.log('[Worker] Initializing cleanup sweepers (Orphan & Drift)...');
+  console.log('[Cleanup] Cleanup worker registered — waiting for Redis...');
+
+  if (redis.status === 'ready') {
+    _beginCleanupIntervals();
+  } else {
+    redis.once('ready', _beginCleanupIntervals);
+  }
+}
+
+function _beginCleanupIntervals() {
+  console.log('[Cleanup] Redis ready — starting sweep intervals.');
   setInterval(sweepDisconnected, 10000); // Orphan GC every 10s
   setInterval(sweepQueueDrift, 30000);   // Drift GC every 30s
 }
