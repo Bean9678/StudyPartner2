@@ -1,112 +1,137 @@
+/**
+ * server.js — Main entry point
+ *
+ * Tinder-style real-time chat backend
+ * Stack: Node.js + Express + Socket.io
+ *
+ * Run: node server.js
+ * Env vars: PORT (default 3000), CLIENT_ORIGIN (default *)
+ */
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 
-const app = express();
-// Frontend will be on Firebase Hosting, so we don't serve static files here.
+const matchRoutes = require('./matchRoutes');
+const { attachHandlers } = require('./socketHandlers');
+const { startWorker } = require('./queueWorker');
+const { startCleanup } = require('./cleanupWorker');
 
-// Enable CORS for all Express HTTP routes
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST']
-}));
-
-const server = http.createServer(app);
-
-// Enable CORS for all origins to allow connection from Firebase Hosting
-const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
-});
-
-let waitingQueue = []; // Stores objects: { socket, filters, username, avatar }
-
-io.on('connection', (socket) => {
-    console.log(`[⚡ CONNECT] New connection: ${socket.id}`);
-
-    // Join search queue
-    socket.on('find_partner', (userData) => {
-        console.log(`[🔍 SEARCH] User ${userData.username} (${socket.id}) is looking for a partner in Grade ${userData.filters.grade}`);
-
-        // Avoid duplicates in queue
-        waitingQueue = waitingQueue.filter(u => u.socket.id !== socket.id);
-
-        // Matching Logic: Find someone with the SAME Grade
-        const partnerIdx = waitingQueue.findIndex(waiter => {
-            return waiter.filters.grade === userData.filters.grade;
-        });
-
-        if (partnerIdx !== -1) {
-            const partner = waitingQueue.splice(partnerIdx, 1)[0];
-            const roomId = `room_${socket.id}_${partner.socket.id}`;
-            
-            console.log(`[🤝 MATCH SUCCESS] Creating room ${roomId} for ${userData.username} and ${partner.username}`);
-
-            socket.join(roomId);
-            partner.socket.join(roomId);
-
-            socket.roomId = roomId;
-            partner.socket.roomId = roomId;
-
-            // Notify both users with partner info
-            socket.emit('matched', { 
-                roomId, 
-                partner: { username: partner.username, avatar: partner.avatar, filters: partner.filters } 
-            });
-            partner.socket.emit('matched', { 
-                roomId, 
-                partner: { username: userData.username, avatar: userData.avatar, filters: userData.filters } 
-            });
-
-        } else {
-            console.log(`[⏳ QUEUED] ${userData.username} added to waiting list.`);
-            waitingQueue.push({ 
-                socket, 
-                filters: userData.filters, 
-                username: userData.username,
-                avatar: userData.avatar
-            });
-        }
-    });
-
-    // Handle messages
-    socket.on('send_message', (data) => {
-        if (socket.roomId) {
-            console.log(`[💬 MESSAGE] ${data.senderName} in ${socket.roomId}: ${data.text}`);
-            socket.to(socket.roomId).emit('receive_message', {
-                text: data.text,
-                senderId: socket.id,
-                senderName: data.senderName
-            });
-        }
-    });
-
-    // Handle typing status
-    socket.on('typing', (isTyping) => {
-        if (socket.roomId) {
-            socket.to(socket.roomId).emit('partner_typing', isTyping);
-        }
-    });
-
-    socket.on('disconnect', () => {
-        console.log(`[❌ DISCONNECT] User ${socket.id} left.`);
-        waitingQueue = waitingQueue.filter(u => u.socket.id !== socket.id);
-
-        if (socket.roomId) {
-            console.log(`[🚪 ROOM CLOSED] Notifying partner in ${socket.roomId}`);
-            socket.to(socket.roomId).emit('partner_left');
-            socket.leave(socket.roomId);
-        }
-    });
-});
-
+// ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-app.get('/health', (req, res) => res.status(200).send('OK'));
+// Whitelist all allowed origins. Set CLIENT_URL in Railway env vars.
+const ALLOWED_ORIGINS = [
+  // studypartner-d6205 (active Firebase project)
+  'https://studypartner-d6205.web.app',
+  'https://studypartner-d6205.firebaseapp.com',
+  // studypartner2-14105 (legacy / alternate)
+  'https://studypartner2-14105.web.app',
+  'https://studypartner2-14105.firebaseapp.com',
+  process.env.CLIENT_URL,
+  // Local dev
+  'http://localhost:5173',
+  'http://localhost:3000',
+].filter(Boolean);
 
+function isOriginAllowed(origin) {
+  if (!origin) return true; // Allow non-browser requests (e.g., curl health checks)
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
+// ─── Express App ──────────────────────────────────────────────────────────────
+const app = express();
+
+// Trust first proxy (required for Railway/Render to resolve correct IP + protocol)
+app.set('trust proxy', 1);
+
+// CORS — strictly whitelisted for Firebase + local dev
+app.use(cors({
+  origin: (origin, callback) => {
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`[CORS] Blocked origin: ${origin}`);
+      callback(new Error(`CORS policy: Origin ${origin} is not allowed.`));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// ─── Input validation middleware ──────────────────────────────────────────────
+app.use((req, _res, next) => {
+  // Sanitise query strings and params — strip prototype-pollution keys
+  const dangerous = ['__proto__', 'constructor', 'prototype'];
+  const clean = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const key of dangerous) delete obj[key];
+  };
+  clean(req.query);
+  clean(req.params);
+  clean(req.body);
+  next();
+});
+
+// ─── Static files (optional) ──────────────────────────────────────────────────
+// Serve the frontend if deployed on same server (Firebase hosting skips this)
+app.use(express.static('public'));
+
+// ─── REST API routes ──────────────────────────────────────────────────────────
+app.use('/api', matchRoutes);
+
+// 404 fallback for unmatched API routes
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
+// ─── HTTP + Socket.io ─────────────────────────────────────────────────────────
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Socket.io CORS: Origin ${origin} not allowed.`));
+      }
+    },
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+  // Force WebSocket transport immediately — avoids polling CORS pre-flight on Firebase
+  transports: ['websocket', 'polling'],
+  // Increase max payload for file chunks
+  maxHttpBufferSize: 10 * 1024 * 1024, // 10 MB
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
+
+// ─── Socket handlers ──────────────────────────────────────────────────────────
+attachHandlers(io);
+
+// ─── Queue Worker & Scavenger ─────────────────────────────────────────────────
+startWorker();
+startCleanup();
+
+// ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-    console.log(`[🚀 SERVER] Production-ready engine running on port ${PORT}`);
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`   Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}`);
+  console.log(`   REST API:    http://localhost:${PORT}/api`);
+  console.log(`   Health:      http://localhost:${PORT}/api/health\n`);
+});
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+process.on('SIGTERM', () => {
+  console.log('[SIGTERM] Shutting down gracefully...');
+  server.close(() => process.exit(0));
+});
+process.on('SIGINT', () => {
+  console.log('[SIGINT] Shutting down...');
+  server.close(() => process.exit(0));
 });
