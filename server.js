@@ -46,8 +46,7 @@ const app = express();
 // Trust first proxy (required for Railway/Render to resolve correct IP + protocol)
 app.set('trust proxy', 1);
 
-// CORS — strictly whitelisted for Firebase + local dev
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     if (isOriginAllowed(origin)) {
       callback(null, true);
@@ -58,8 +57,14 @@ app.use(cors({
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-}));
+  // credentials: false — frontend uses 'omit'; enabling this would require
+  // Access-Control-Allow-Credentials AND a non-wildcard origin on every response.
+  credentials: false,
+};
+
+// Explicitly handle OPTIONS preflights FIRST so they never hit auth/routes
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -101,7 +106,7 @@ const io = new Server(server, {
       }
     },
     methods: ['GET', 'POST'],
-    credentials: true,
+    credentials: false,
   },
   // Force WebSocket transport immediately — avoids polling CORS pre-flight on Firebase
   transports: ['websocket', 'polling'],
