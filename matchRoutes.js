@@ -42,16 +42,38 @@ router.post('/start-search', async (req, res) => {
   try {
     const { uid, grade, subjects, gender } = req.body;
     if (!uid) return res.status(400).json({ error: 'uid required' });
+
+    // Quick Redis connectivity check before doing anything else
+    try {
+      await db.redis.ping();
+    } catch (redisErr) {
+      console.error('[/start-search] Redis unreachable:', redisErr.message);
+      return res.status(503).json({ error: 'Queue service unavailable. Redis is unreachable.' });
+    }
+
+    // Force-clear any stale state so the user can always re-enter the queue via REST.
+    // (The socket state machine can block users stuck in a non-searching state.)
+    await db.redis.hset(`user_state:${uid}`, 'state', 'searching');
     
-    // Add to background database queue securely
-    // In production, we assume the user's socket is currently connected or they are dispatching rest.
-    await db.addToQueue({ uid, grade, subjects, gender, socketId: null });
-    log('USER_QUEUED_REST', { uid, queueSize: await db.getQueueSize() });
+    // Add to the sorted-set queue directly
+    const payload = JSON.stringify({ uid, grade, subjects, gender, socketId: null });
+    // Remove stale entry for this uid first (idempotent re-queue)
+    const existing = await db.redis.zrange('match_queue', 0, -1);
+    for (const el of existing) {
+      try {
+        const parsed = JSON.parse(el);
+        if (parsed.uid === uid) { await db.redis.zrem('match_queue', el); break; }
+      } catch {}
+    }
+    await db.redis.zadd('match_queue', Date.now(), payload);
+
+    const queueSize = await db.redis.zcard('match_queue');
+    log('USER_QUEUED_REST', { uid, queueSize });
     
-    return res.json({ success: true, message: 'Searching in background' });
+    return res.json({ success: true, message: 'Searching in background', queueSize });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Internal Server Error' });
+    console.error('[/start-search] Unexpected error:', err.message, err.stack);
+    return res.status(500).json({ error: err.message || 'Internal Server Error' });
   }
 });
 
