@@ -1,3 +1,5 @@
+console.log("ALL ENV:", process.env);
+
 /**
  * server.js — Main entry point
  *
