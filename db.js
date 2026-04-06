@@ -15,77 +15,63 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/chatApp')
   .catch(err => console.error('[DB] MongoDB Connection Error:', err));
 
 // ─── Redis Connection ─────────────────────────────────────────────────────────
-//
-// KEY DECISIONS:
-//   maxRetriesPerRequest: null — REQUIRED. Any non-null value causes
-//     MaxRetriesPerRequestError when Redis is briefly unavailable (e.g. Railway
-//     cold-start). ioredis/BullMQ expect null for long-lived blocking commands.
-//
-//   lazyConnect: true — The client won't attempt to connect until the first
-//     command is issued. This prevents a crash-at-boot when Railway Redis
-//     hasn't warmed up yet, and avoids flooding logs with connection errors
-//     before the server is ready to accept requests.
-//
-//   connectTimeout — Hard upper bound so a hung TCP handshake doesn't block
-//     the event loop indefinitely.
+// Debug: print at startup so Railway logs confirm the variable is injected
+console.log('[Redis] REDIS_URL =', process.env.REDIS_URL
+  ? process.env.REDIS_URL.replace(/:[^:@]+@/, ':***@')   // mask password
+  : 'UNDEFINED ← variable is missing!'
+);
 
-const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+if (!process.env.REDIS_URL) {
+  console.error(
+    '[Redis] FATAL: REDIS_URL is not set.\n' +
+    '  → In Railway: open your backend service → Variables tab\n' +
+    '  → Click "Add Reference" and select the Redis plugin variable REDIS_URL\n' +
+    '  → Redeploy the service after saving.\n' +
+    '  Refusing to start with a localhost fallback.'
+  );
+  // Throw so Railway marks the deploy as failed rather than silently connecting to 127.0.0.1
+  throw new Error('REDIS_URL is required but was not provided.');
+}
+
+const REDIS_URL = process.env.REDIS_URL;
 
 const redisOptions = {
-  // ── Critical: must be null for BullMQ / long-lived commands ──
+  // Must be null — any finite value causes MaxRetriesPerRequestError when
+  // Redis is briefly unavailable (Railway cold-start, deploy restart).
   maxRetriesPerRequest: null,
 
-  // ── Lazy connect: defer until first command ──
-  lazyConnect: true,
-
-  // ── Hard timeout on initial TCP connect (ms) ──
   connectTimeout: 10_000,
 
-  // ── Exponential backoff: 200ms → 400ms → … → 5s cap, stop after 20 tries ──
+  // Exponential backoff: 200ms → 300ms → … → 5s cap, stop after 20 tries
   retryStrategy(times) {
     if (times > 20) {
       console.error('[Redis] Giving up after 20 reconnect attempts.');
-      return null; // null = stop retrying (ioredis won't throw, just stays disconnected)
+      return null;
     }
-    const delay = Math.min(200 * Math.pow(1.5, times), 5000);
-    return Math.round(delay);
+    return Math.min(200 * Math.pow(1.5, times), 5000) | 0;
   },
 
-  // ── Reconnect on READONLY (Redis Sentinel / cluster failover) ──
   reconnectOnError(err) {
+    // Reconnect on Redis Sentinel / cluster failover READONLY errors
     return err.message.includes('READONLY');
   },
 };
 
-// Railway Redis uses rediss:// (TLS). Add tls:{} so ioredis negotiates SSL.
+// Railway Redis uses rediss:// (TLS)
 if (REDIS_URL.startsWith('rediss://')) {
   redisOptions.tls = { rejectUnauthorized: false };
 }
 
 const redis = new Redis(REDIS_URL, redisOptions);
 
-// ── Non-spammy event logging ──
-let _redisReady = false;
-redis.on('ready', () => {
-  _redisReady = true;
-  const safeUrl = REDIS_URL.replace(/:[^:@]+@/, ':***@');
-  console.log('[Redis] Connected and ready:', safeUrl);
-});
-redis.on('close',       () => { _redisReady = false; console.warn('[Redis] Connection closed.'); });
+redis.on('connect',      () => console.log('[Redis] Connected:', REDIS_URL.replace(/:[^:@]+@/, ':***@')));
+redis.on('close',        () => console.warn('[Redis] Connection closed.'));
 redis.on('reconnecting', (ms) => console.log(`[Redis] Reconnecting in ${ms}ms…`));
-redis.on('error',        (err) => {
-  // Suppress the ECONNREFUSED flood — one log per unique message is enough
-  if (!_redisReady) {
-    console.error('[Redis] Connection error (waiting for Redis to be available):', err.message);
-  }
-});
-
-// Kick off the lazy connection so the client is ready before the first request
-redis.connect().catch((err) => {
-  console.error('[Redis] Initial connect failed (will retry automatically):', err.message);
-});
+// IMPORTANT: always attach an error listener — without it Node crashes on unhandled error events
+redis.on('error',        (err) => console.error('[Redis] Error:', err.message));
 
 // ─── LUA SCRIPTS (ATOMIC GUARANTEES) ─────────────────────────────────────────
+
 
 redis.defineCommand('transitionUserAtomic', {
   numberOfKeys: 1,
