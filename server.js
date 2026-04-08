@@ -32,9 +32,6 @@ const ALLOWED_ORIGINS = [
   'https://studypartner2-14105.web.app',
   'https://studypartner2-14105.firebaseapp.com',
   process.env.CLIENT_URL,
-  // Local dev
-  'http://localhost:5173',
-  'http://localhost:3000',
 ].filter(Boolean);
 
 function isOriginAllowed(origin) {
@@ -59,9 +56,9 @@ const corsOptions = {
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  // credentials: false — frontend uses 'omit'; enabling this would require
-  // Access-Control-Allow-Credentials AND a non-wildcard origin on every response.
-  credentials: false,
+  // credentials: true is REQUIRED when frontend uses withCredentials: true
+  // for cross-domain requests.
+  credentials: true,
 };
 
 // Explicitly handle OPTIONS preflights FIRST so they never hit auth/routes
@@ -108,7 +105,7 @@ const io = new Server(server, {
       }
     },
     methods: ['GET', 'POST'],
-    credentials: false,
+    credentials: true,
   },
   // Force WebSocket transport immediately — avoids polling CORS pre-flight on Firebase
   transports: ['websocket', 'polling'],
@@ -126,11 +123,9 @@ startWorker();
 startCleanup();
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}`);
-  console.log(`   REST API:    http://localhost:${PORT}/api`);
-  console.log(`   Health:      http://localhost:${PORT}/api/health\n`);
+  console.log(`   Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}\n`);
 });
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────

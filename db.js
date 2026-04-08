@@ -42,6 +42,10 @@ const redisOptions = {
 
   connectTimeout: 10_000,
 
+  // ioredis defaults to IPv4. Railway's private networking (.railway.internal) uses IPv6 exclusively.
+  // Without family: 6, the connection will hang indefinitely in a "connecting..." state.
+  family: REDIS_URL.includes('railway.internal') ? 6 : 4,
+
   // Exponential backoff: 200ms → 300ms → … → 5s cap, stop after 20 tries
   retryStrategy(times) {
     if (times > 20) {
